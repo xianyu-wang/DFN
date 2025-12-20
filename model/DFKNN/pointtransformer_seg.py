@@ -9,7 +9,7 @@ import einops
 
 from lib.pointops.functions import pointops
 
-class GatherNeighborFixed(nn.Module):
+class GatherNeighbor(nn.Module):
     def __init__(self, n_neighbor, n_kernel):
         super().__init__()
         self.n_neigh = n_neighbor
@@ -35,16 +35,14 @@ class GatherNeighborFixed(nn.Module):
             channel = feat_list[i].shape[-1]
             feat_list[i] = feat_list[i][idx_large_neigh.view(-1).long(), :].view(n_point, self.n_large_neigh, channel)
 
-        # 在每个标准邻域里最远点采样选kernel
         offset_kernel = (torch.ones(n_point)*self.n_kernel).cuda()
         offset_kernel = torch.cumsum(offset_kernel, 0).int()
-        ############################## TOOOOOOOOOO LONG ##########################################
+
         idx_kernel = torch.randperm(self.n_small_neigh, device='cuda')[:self.n_kernel]
         idx_kernel = idx_kernel.repeat(pts_small_neigh.shape[0], 1)
         kernel_points = self.vector_gather(pts_small_neigh, idx_kernel)
-        ##########################################################################################
-        # TODO: kernel shift
-        # 计算大邻域点到各kernel距离，选最小的self.n_neigh个
+
+
         pts_large_neigh = pts_large_neigh.view(-1, self.n_large_neigh, 3)
         
         dist, idx_nearest_kernel = torch.cdist(pts_large_neigh, kernel_points, p=2.0, compute_mode='donot_use_mm_for_euclid_dist').min(dim=-1)
@@ -55,95 +53,9 @@ class GatherNeighborFixed(nn.Module):
         for i in range(len(feat_list)):
             feat_list[i] = self.vector_gather(feat_list[i], idx)
         xyz = self.vector_gather(pts_large_neigh, idx)
-        # if self.use_xyz:
-        #     feat = torch.cat((self.vector_gather(pts_large_neigh, idx), feat), -1)
             
         return xyz, feat_list
 
-class GatherNeighbor(nn.Module):
-    def __init__(self, n_neighbor, n_kernel):
-        super().__init__()
-        self.n_neigh = n_neighbor
-        self.n_small_neigh = n_neighbor
-        self.n_large_neigh = 4 * n_neighbor
-        self.n_kernel = n_kernel
-        self.fc1 = nn.Linear(self.n_large_neigh * 3, 32)
-        self.fc2 = nn.Linear(32, 8)
-        self.fc3 = nn.Linear(8, 3)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.bn2 = nn.BatchNorm1d(8)
-        
-        
-    def forward(self, xyz, new_xyz, feat_list, offset, new_offset, label=None):
-
-        idx_small_neigh, _ = pointops.knnquery(self.n_small_neigh, xyz, new_xyz, offset, new_offset)
-
-        idx_large_neigh, _ = pointops.knnquery(self.n_large_neigh, xyz, new_xyz, offset, new_offset)
-        
-        n_point = idx_small_neigh.shape[0]
-
-        
-        pts_small_neigh = xyz[idx_small_neigh.view(-1).long(), :].view(n_point, self.n_small_neigh, 3)
-        
-        max_shift = torch.cdist(new_xyz.unsqueeze(1), pts_small_neigh, compute_mode='donot_use_mm_for_euclid_dist').max(dim=-1)[0]
-        
-        pts_large_neigh = xyz[idx_large_neigh.view(-1).long(), :].view(n_point, self.n_large_neigh, 3)
-        for i in range(len(feat_list)):
-            channel = feat_list[i].shape[-1]
-            feat_list[i] = feat_list[i][idx_large_neigh.view(-1).long(), :].view(n_point, self.n_large_neigh, channel)
-
-        offset_kernel = (torch.ones(n_point)*self.n_kernel).cuda()
-        offset_kernel = torch.cumsum(offset_kernel, 0).int()
-
-        idx_kernel = torch.linspace(0, self.n_neigh-1, steps=self.n_kernel, dtype=torch.int64, device='cuda')
-        idx_kernel = idx_kernel.repeat(pts_small_neigh.shape[0], 1)
-        kernel_points = self.vector_gather(pts_small_neigh, idx_kernel) # [n_key, n_kernel, 3]
-
-        # kernel shift
-        rela_coor = kernel_points.unsqueeze(2).repeat(1, 1, self.n_large_neigh, 1) - pts_large_neigh.unsqueeze(1).repeat(1, self.n_kernel, 1, 1) # [n_keys, n_kernel, n_large_neigh, 3]
-        rela_coor = rela_coor.view(n_point, self.n_kernel, -1) # [n_keys, n_kernel, n_large_neigh*3]
-        rela_coor = torch.tanh(self.bn1(self.fc1(rela_coor).transpose(1,2))).transpose(1,2)
-        rela_coor = torch.tanh(self.bn2(self.fc2(rela_coor).transpose(1,2))).transpose(1,2)
-        rela_coor = torch.tanh(self.fc3(rela_coor))
-        rela_coor = rela_coor * max_shift.unsqueeze(-1).repeat(1,1,3)
-        kernel_points = kernel_points + rela_coor # [n_keys, n_kernel, 3]
-        dist, _ = torch.cdist(pts_large_neigh, kernel_points, p=2.0, compute_mode='donot_use_mm_for_euclid_dist').min(dim=-1)
-        
-        _, idx = torch.sort(dist)
-        idx = idx[:, :self.n_neigh]
-        dist = dist[:, :self.n_neigh]
-
-        for i in range(len(feat_list)):
-            feat_list[i] = self.vector_gather(feat_list[i], idx)
-        xyz = self.vector_gather(pts_large_neigh, idx)
-        dist = 1 - dist/max_shift.repeat(1,self.n_neigh)
-        for i in range(len(feat_list)):
-            feat_list[i] = feat_list[i] * dist.unsqueeze(-1).repeat(1,1,feat_list[i].shape[-1])
-
-            
-        return xyz, feat_list
-    
-    def vector_gather(self, vectors, indices):
-        """
-        Gathers (batched) vectors according to indices.
-        Arguments:
-            vectors: Tensor[N, L, D]
-            indices: Tensor[N, K] or Tensor[N]
-        Returns:
-            Tensor[N, K, D] or Tensor[N, D]
-        """
-        N, L, D = vectors.shape
-        squeeze = False
-        if indices.ndim == 1:
-            squeeze = True
-            indices = indices.unsqueeze(-1)
-        N2, K = indices.shape
-        assert N == N2
-        indices = einops.repeat(indices, "N K -> N K D", D=D)
-        out = torch.gather(vectors, dim=1, index=indices)
-        if squeeze:
-            out = out.squeeze(1)
-        return out
     
 
 class GatherNeighborv2(nn.Module):
